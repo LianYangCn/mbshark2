@@ -98,6 +98,18 @@ pub fn entry_to_plain(entry: &Entry) -> String {
     lines_to_plain(&format_entry(entry))
 }
 
+/// Decide whether a visual separator should be inserted before an entry.
+///
+/// Separator rules:
+/// - Different transaction (counter changed): always separate
+/// - Orphan / Parse entry: cannot belong to a normal session, so separate
+///   it even if the counter happens to match
+pub fn should_separate(prev_counter: Option<u64>, current_counter: u64, tag: Tag) -> bool {
+    let counter_changed = prev_counter.is_some_and(|pc| pc != current_counter);
+    let is_standalone = matches!(tag, Tag::Orphan | Tag::Parse);
+    counter_changed || is_standalone
+}
+
 // --- builders ----------------------------------------------------------------
 
 fn header_line(tag: Tag, ts: DateTime<Local>, counter: u64, raw: &[u8]) -> Line {

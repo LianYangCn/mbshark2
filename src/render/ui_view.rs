@@ -8,8 +8,11 @@ use std::collections::VecDeque;
 
 use egui::{Color32, RichText};
 
-use crate::render::format::{Line, SpanRole};
+use crate::render::format::{should_separate, Line, SpanRole};
 use crate::session::model::Tag;
+
+/// Error / parse-failure color shared between the capture view and header banner.
+pub const ERROR_RED: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49);
 
 /// Render the capture view inside a vertical `ScrollArea`. Pinned to the
 /// bottom while `auto_scroll` is on.
@@ -34,13 +37,7 @@ pub fn show(
 
             let mut prev_counter: Option<u64> = None;
             for (entry, lines) in entries.iter().zip(lines_cache.iter()) {
-                // Separator rules:
-                // - Different transaction (counter changed): always separate
-                // - Orphan / Parse entry: cannot belong to a normal session,
-                //   so separate it even if the counter happens to match
-                let counter_changed = prev_counter.is_some_and(|pc| pc != entry.counter);
-                let is_standalone = matches!(entry.tag, Tag::Orphan | Tag::Parse);
-                if counter_changed || is_standalone {
+                if should_separate(prev_counter, entry.counter, entry.tag) {
                     ui.separator();
                 }
                 prev_counter = Some(entry.counter);
@@ -71,14 +68,14 @@ fn tag_color(tag: Tag) -> Color32 {
         Tag::Request => Color32::from_rgb(0x4a, 0x9f, 0xf0), // blue
         Tag::Response => Color32::from_rgb(0x3f, 0xb9, 0x50), // green
         Tag::Orphan => Color32::from_rgb(0xd2, 0x99, 0x22), // orange
-        Tag::Parse => Color32::from_rgb(0xf8, 0x51, 0x49), // red
+        Tag::Parse => ERROR_RED,
     }
 }
 
 fn role_color(role: SpanRole, tag: Tag) -> Color32 {
     match role {
         SpanRole::Tag => tag_color(tag),
-        SpanRole::Error => Color32::from_rgb(0xf8, 0x51, 0x49), // red
+        SpanRole::Error => ERROR_RED,
         SpanRole::Hex => Color32::from_rgb(0xb1, 0xba, 0xca), // light gray
         SpanRole::Timestamp => Color32::from_rgb(0x8b, 0x94, 0x9e), // dim gray
         SpanRole::Address => Color32::from_rgb(0xd2, 0xa8, 0xff), // purple

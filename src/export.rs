@@ -5,21 +5,15 @@ use std::path::Path;
 
 use chrono::Local;
 
-use crate::render::format::{format_entry, lines_to_plain};
+use crate::render::format::{format_entry, lines_to_plain, should_separate};
 use crate::session::model::Entry;
 
 /// Render all `entries` as plain text (no color), one block per entry.
-/// Separator rules (matching the UI's line separators):
-/// - Insert `---` between different transactions (counter changes)
-/// - Insert `---` before any Orphan / Parse entry (it cannot belong to a
-///   normal request/response session, even if it shares a counter)
 pub fn entries_to_text(entries: &VecDeque<Entry>) -> String {
     let mut text = String::new();
     let mut prev_counter: Option<u64> = None;
     for entry in entries {
-        let counter_changed = prev_counter.is_some_and(|pc| pc != entry.counter);
-        let is_standalone = matches!(entry.tag, crate::session::model::Tag::Orphan | crate::session::model::Tag::Parse);
-        if counter_changed || is_standalone {
+        if should_separate(prev_counter, entry.counter, entry.tag) {
             text.push_str("---\n");
         }
         prev_counter = Some(entry.counter);

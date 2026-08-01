@@ -11,7 +11,7 @@ use crate::capture::engine::{CaptureEngine, Command, Event};
 use crate::export;
 use crate::render::format::{format_entry, Line};
 use crate::render::settings::{SettingsAction, SettingsState};
-use crate::render::ui_view;
+use crate::render::ui_view::{self, ERROR_RED};
 use crate::session::model::Entry;
 
 /// Maximum entries retained in memory (FIFO, drop oldest).
@@ -192,17 +192,14 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(err) = &self.last_error {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0xf8, 0x51, 0x49),
-                    format!("⚠ {err}"),
-                );
+                ui.colored_label(ERROR_RED, format!("⚠ {err}"));
                 ui.separator();
             }
             ui_view::show(
                 ui,
                 &self.entries,
                 &self.lines_cache,
-                self.settings.auto_scroll,
+                self.settings.auto_scroll && self.capturing,
             );
         });
     }

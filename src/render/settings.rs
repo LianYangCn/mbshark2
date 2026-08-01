@@ -105,7 +105,7 @@ impl SettingsState {
                     .desired_width(160.0)
                     .hint_text("/dev/ttyUSB0"),
             );
-            egui::ComboBox::from_label("")
+            egui::ComboBox::from_id_salt("port")
                 .selected_text(if self.port.is_empty() { "<select>" } else { &self.port })
                 .show_ui(ui, |ui| {
                     for p in &self.ports_cache {
@@ -120,7 +120,7 @@ impl SettingsState {
         // Baud
         ui.horizontal(|ui| {
             ui.label("Baud:");
-            egui::ComboBox::from_label("baud")
+            egui::ComboBox::from_id_salt("baud")
                 .selected_text(self.baud.clone())
                 .show_ui(ui, |ui| {
                     for b in ["9600", "19200", "38400", "57600", "115200", "230400"] {
@@ -132,7 +132,7 @@ impl SettingsState {
         // Data bits
         ui.horizontal(|ui| {
             ui.label("Data bits:");
-            egui::ComboBox::from_label("data_bits")
+            egui::ComboBox::from_id_salt("data_bits")
                 .selected_text(format!("{}", self.data_bits))
                 .show_ui(ui, |ui| {
                     for d in [5u8, 6, 7, 8] {
@@ -144,7 +144,7 @@ impl SettingsState {
         // Parity
         ui.horizontal(|ui| {
             ui.label("Parity:");
-            egui::ComboBox::from_label("parity")
+            egui::ComboBox::from_id_salt("parity")
                 .selected_text(self.parity.clone())
                 .show_ui(ui, |ui| {
                     for p in ["None", "Even", "Odd"] {
@@ -156,7 +156,7 @@ impl SettingsState {
         // Stop bits
         ui.horizontal(|ui| {
             ui.label("Stop bits:");
-            egui::ComboBox::from_label("stop_bits")
+            egui::ComboBox::from_id_salt("stop_bits")
                 .selected_text(format!("{}", self.stop_bits))
                 .show_ui(ui, |ui| {
                     for s in [1u8, 2] {
@@ -168,7 +168,7 @@ impl SettingsState {
         // Flow control
         ui.horizontal(|ui| {
             ui.label("Flow control:");
-            egui::ComboBox::from_label("flow_control")
+            egui::ComboBox::from_id_salt("flow_control")
                 .selected_text(self.flow_control.clone())
                 .show_ui(ui, |ui| {
                     for f in ["None", "Software", "Hardware"] {
