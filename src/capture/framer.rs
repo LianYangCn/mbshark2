@@ -1,15 +1,28 @@
 //! RTU frame assembly from a byte stream.
 //!
-//! Modbus RTU delimits frames by a silent interval of at least 3.5 character
-//! times on the bus. This struct accumulates received bytes and exposes the
-//! deadline at which the current buffer should be emitted as a complete frame.
-//! It is purely synchronous: the async read loop (in `capture::engine`) drives
-//! it with `push` / `gap_deadline` / `flush_due`.
+//! Frame delimiting uses two complementary mechanisms:
 //!
-//! CRC and structural validation happen in [`crate::protocol::frame`]; the
-//! framer just yields the raw bytes of a candidate frame.
+//! - **Length-prediction + CRC split (primary)** — [`Framer::drain_complete`]
+//!   peels complete frames off the front of the buffer by predicting each
+//!   frame's length from its function-code structure and confirming the
+//!   boundary with a CRC check. This is what makes coalesced frames (multiple
+//!   RTU frames delivered in one `read()`, common on real hardware) split
+//!   correctly, since the OS stamps the whole read with a single time and the
+//!   inter-frame gap is invisible to timing logic.
+//!
+//! - **3.5-character inter-frame gap (fallback)** — [`Framer::gap_deadline`]
+//!   exposes the deadline at which whatever remains in the buffer (an
+//!   indeterminate-function-code frame, a partial frame, or a corrupt frame
+//!   that failed CRC) is emitted as a single candidate frame, which becomes a
+//!   `ParseFailure` entry if invalid. Nothing is ever discarded.
+//!
+//! The struct is purely synchronous: the async read loop (in `capture::engine`)
+//! drives it with `push` / `drain_complete` / `gap_deadline` / `flush_due`.
 
 use std::time::{Duration, Instant};
+
+use crate::protocol::crc::crc16;
+use crate::protocol::frame::{frame_length_hint, LenHint};
 
 /// Maximum RTU frame size (256 bytes) plus a small margin. If the buffer
 /// exceeds this without a frame gap we force a flush, treating the contents as
@@ -73,6 +86,49 @@ impl Framer {
     /// Emit the accumulated bytes as a candidate frame and clear the buffer.
     pub fn flush_due(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.buf)
+    }
+
+    /// Peel all complete, CRC-valid frames off the front of the buffer.
+    ///
+    /// This is the primary frame-delimiting mechanism. Real serial stacks
+    /// routinely deliver bytes from multiple RTU frames in a single `read()`
+    /// (all stamped with one time), so the inter-frame time gap is invisible to
+    /// the gap-timer logic. Instead we predict each frame's length from its
+    /// function-code structure (`frame_length_hint`) and confirm the boundary
+    /// with a CRC check, greedily consuming one frame at a time.
+    ///
+    /// Any indeterminate / partial / CRC-failing tail is left in the buffer for
+    /// the gap timer to flush as a single parse-failure entry (so nothing is
+    /// ever discarded). The returned vectors are already CRC-validated; callers
+    /// re-validate via `ModbusFrame::from_bytes` harmlessly.
+    pub fn drain_complete(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            if self.buf.len() < 4 {
+                break;
+            }
+            let cands = match frame_length_hint(&self.buf) {
+                LenHint::Indeterminate | LenHint::NeedMore(_) => break,
+                LenHint::Candidates(c) => c,
+            };
+            let mut peeled: Option<usize> = None;
+            for &n in &cands {
+                if !(4..=MAX_FRAME_BYTES).contains(&n) || self.buf.len() < n {
+                    continue;
+                }
+                let payload = &self.buf[..n - 2];
+                let stored = u16::from_le_bytes([self.buf[n - 2], self.buf[n - 1]]);
+                if crc16(payload) == stored {
+                    peeled = Some(n);
+                    break; // candidates are ascending: first valid wins
+                }
+            }
+            match peeled {
+                Some(n) => out.push(self.buf.drain(..n).collect::<Vec<u8>>()),
+                None => break, // need more bytes, or a corrupt frame → wait for gap
+            }
+        }
+        out
     }
 
     /// Whether the buffer has grown past the safety limit and should be
@@ -145,5 +201,114 @@ mod tests {
         f.push(&[0x03, 0x00], t0);
         assert_eq!(f.buffer_len(), 3);
         assert_eq!(f.flush_due(), vec![0x01, 0x03, 0x00]);
+    }
+
+    // --- drain_complete tests ----------------------------------------------
+
+    /// Build a valid RTU frame (slave + fc + data + CRC) from a payload.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut v = payload.to_vec();
+        crate::protocol::crc::append_crc(&mut v);
+        v
+    }
+
+    /// A framer with a huge gap so the gap timer never interferes with tests.
+    fn frozen_framer() -> Framer {
+        Framer::with_gap(Duration::from_secs(60))
+    }
+
+    #[test]
+    fn drain_splits_two_coalesced_requests() {
+        let mut f = frozen_framer();
+        let req = frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]);
+        let mut both = req.clone();
+        both.extend_from_slice(&req);
+        f.push(&both, Instant::now());
+
+        let out = f.drain_complete();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], req);
+        assert_eq!(out[1], req);
+        assert_eq!(f.buffer_len(), 0);
+    }
+
+    #[test]
+    fn drain_splits_request_then_response() {
+        let mut f = frozen_framer();
+        let req = frame(&[0x02, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x01]);
+        let resp = frame(&[0x02, 0x10, 0x00, 0x00, 0x00, 0x02]);
+        let mut both = req.clone();
+        both.extend_from_slice(&resp);
+        f.push(&both, Instant::now());
+
+        let out = f.drain_complete();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], req);
+        assert_eq!(out[1], resp);
+        assert_eq!(f.buffer_len(), 0);
+    }
+
+    #[test]
+    fn drain_leaves_partial_tail() {
+        let mut f = frozen_framer();
+        let req = frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]);
+        let mut both = req.clone();
+        both.extend_from_slice(&[0x01, 0x03, 0x00]); // 3 bytes of a future frame
+        f.push(&both, Instant::now());
+
+        let out = f.drain_complete();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], req);
+        assert_eq!(f.buffer_len(), 3);
+        assert_eq!(f.flush_due(), vec![0x01, 0x03, 0x00]);
+    }
+
+    #[test]
+    fn drain_partial_frame_returns_empty() {
+        let mut f = frozen_framer();
+        // First 6 bytes of an 0x03 request (no CRC) — no complete frame yet.
+        f.push(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A], Instant::now());
+        let out = f.drain_complete();
+        assert!(out.is_empty());
+        assert_eq!(f.buffer_len(), 6);
+    }
+
+    #[test]
+    fn drain_indeterminate_function_code_breaks() {
+        let mut f = frozen_framer();
+        // A valid 0x08 (Diagnostics) frame is Indeterminate, so drain_complete
+        // must NOT peel it — even when a valid 0x03 request follows. The whole
+        // buffer is left for the gap timer to flush as one parse-failure entry.
+        let diag = frame(&[0x01, 0x08, 0x00, 0x00]);
+        let req = frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]);
+        let mut both = diag.clone();
+        both.extend_from_slice(&req);
+        f.push(&both, Instant::now());
+
+        let out = f.drain_complete();
+        assert!(out.is_empty(), "Indeterminate FC must not be peeled");
+        assert_eq!(f.buffer_len(), both.len());
+    }
+
+    #[test]
+    fn drain_overflow_candidate_is_skipped() {
+        let mut f = frozen_framer();
+        // 0x18 with a corrupt u16 count of 0xFFFF → response candidate
+        // 6 + 65535 = 65541 (> MAX_FRAME_BYTES). The 6-byte request candidate
+        // isn't satisfiable with only 4 bytes, so nothing is peeled and no
+        // panic occurs on the oversized candidate.
+        f.push(&[0x01, 0x18, 0xFF, 0xFF], Instant::now());
+        let out = f.drain_complete();
+        assert!(out.is_empty());
+        assert_eq!(f.buffer_len(), 4);
+    }
+
+    #[test]
+    fn drain_after_reset_returns_empty() {
+        let mut f = frozen_framer();
+        f.push(&frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]), Instant::now());
+        f.reset();
+        assert!(f.drain_complete().is_empty());
+        assert_eq!(f.buffer_len(), 0);
     }
 }

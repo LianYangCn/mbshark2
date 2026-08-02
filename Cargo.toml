@@ -13,7 +13,7 @@ default = ["gui"]
 # GUI feature pulls in eframe/egui/rfd/tokio-serial/serialport, which need
 # system libs on Linux (xcb, xkbcommon, openssl, libudev, gtk3, pkg-config).
 # Disable with --no-default-features to build/test the pure logic layer only.
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:tokio-serial", "dep:serialport"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:tokio-serial", "dep:serialport", "dep:serde", "dep:toml"]
 
 [lib]
 name = "mbshark2"
@@ -30,6 +30,9 @@ egui       = { version = "0.34", optional = true }
 rfd        = { version = "0.15", optional = true }
 tokio-serial = { version = "5.4", optional = true }
 serialport   = { version = "4.9", optional = true }
+
+serde = { version = "1", optional = true, features = ["derive"] }
+toml  = { version = "0.8", optional = true }
 
 tokio = { version = "1", features = ["rt", "time", "sync", "io-util", "macros"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

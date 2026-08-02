@@ -104,11 +104,20 @@ pub fn on_frame(
 
     match role {
         Role::Request => {
-            // Overlapping request (master violated one-outstanding, or we
-            // missed a response): synthesize a timeout for the old one first.
-            if let Some(old) = state.pending.remove(&slave) {
-                out.push(Entry::timeout(now, old.counter));
-                push_timed_out(&mut state.timed_out, slave, old);
+            // RTU is half-duplex: the master has exactly one outstanding
+            // request at a time. A new request (to ANY slave) means every
+            // still-pending request can no longer be answered — synthesize a
+            // NoResponse for each, in counter order for a clean timeline,
+            // before recording the new one. (Nothing is discarded: late
+            // responses still surface as ORPHANs via the timed-out pool.)
+            if !state.pending.is_empty() {
+                let mut stale: Vec<PendingReq> =
+                    state.pending.drain().map(|(_, v)| v).collect();
+                stale.sort_by_key(|r| r.counter);
+                for old in stale {
+                    out.push(Entry::no_response(now, old.counter));
+                    push_timed_out(&mut state.timed_out, old.slave, old);
+                }
             }
             let counter = state.next_counter;
             state.next_counter += 1;
@@ -261,18 +270,36 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_request_forces_timeout() {
+    fn overlapping_request_forces_no_response() {
         let st = PairingState::new(Duration::from_millis(500));
         let (st, _) = on_frame(st, frame(2, 0x03, &[0x00, 0x00, 0x00, 0x0A], t0()).0, pdu_req(0x03, &[0x00, 0x00, 0x00, 0x0A]), t0());
         // Second request for same slave before the first is answered.
         let (st, out) = on_frame(st, frame(2, 0x03, &[0x00, 0x10, 0x00, 0x01], t0()).0, pdu_req(0x03, &[0x00, 0x10, 0x00, 0x01]), t0());
-        // Expect: a synthetic timeout for counter 1, then a new request counter 2.
+        // Expect: a NoResponse for counter 1, then a new request counter 2.
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].counter, 1);
-        assert!(matches!(out[0].body, EntryBody::Timeout));
+        assert!(matches!(out[0].body, EntryBody::NoResponse));
         assert_eq!(out[1].counter, 2);
         assert_eq!(out[1].tag, Tag::Request);
         assert!(st.timed_out.contains_key(&2));
+    }
+
+    #[test]
+    fn cross_slave_new_request_forces_no_response() {
+        // RTU is half-duplex: a new request to a DIFFERENT slave also means
+        // the previous pending request can no longer be answered.
+        let st = PairingState::new(Duration::from_millis(500));
+        let (st, _) = on_frame(st, frame(5, 0x03, &[0x00, 0x00, 0x00, 0x0A], t0()).0, pdu_req(0x03, &[0x00, 0x00, 0x00, 0x0A]), t0());
+        // Request to slave 6 before slave 5 answers.
+        let (st, out) = on_frame(st, frame(6, 0x03, &[0x00, 0x00, 0x00, 0x0A], t0()).0, pdu_req(0x03, &[0x00, 0x00, 0x00, 0x0A]), t0());
+        // Slave 5's pending request is cut short (NoResponse), slave 6 becomes pending.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].counter, 1);
+        assert!(matches!(out[0].body, EntryBody::NoResponse));
+        assert_eq!(out[1].counter, 2);
+        assert_eq!(out[1].tag, Tag::Request);
+        assert!(st.timed_out.contains_key(&5), "slave 5 moved to timed-out pool");
+        assert!(st.pending.contains_key(&6), "slave 6 now pending");
     }
 
     #[test]

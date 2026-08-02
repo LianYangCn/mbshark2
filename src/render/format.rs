@@ -5,6 +5,8 @@
 //! This is the single source of truth for the on-screen / on-disk layout,
 //! matching the three scenarios in the README (normal pair, timeout, orphan).
 
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use chrono::{DateTime, Local};
 
 use crate::protocol::pdu::{exception_text, function_name, ParsedPdu, PduDetails};
@@ -66,6 +68,9 @@ pub fn format_entry(entry: &Entry) -> Vec<Line> {
         EntryBody::Timeout => {
             lines.push(error_line("Timeout"));
         }
+        EntryBody::NoResponse => {
+            lines.push(error_line("No Response"));
+        }
         EntryBody::Orphan { slave, orig, .. } => {
             lines.push(slave_line(*slave));
             lines.push(error_line("Response Timeout"));
@@ -108,6 +113,39 @@ pub fn should_separate(prev_counter: Option<u64>, current_counter: u64, tag: Tag
     let counter_changed = prev_counter.is_some_and(|pc| pc != current_counter);
     let is_standalone = matches!(tag, Tag::Orphan | Tag::Parse);
     counter_changed || is_standalone
+}
+
+// --- slave filtering -------------------------------------------------------
+
+/// Build a `counter → slave` map from the request entries.
+///
+/// Synthetic [`EntryBody::Timeout`] / [`EntryBody::NoResponse`] entries reuse
+/// their original request's `counter` (see `session::pairing`), so a timeout's
+/// slave can be recovered by looking its counter up here. This lets the filter
+/// hide an entire session (request + its response/timeout) for a hidden slave.
+pub fn counter_slave_map(entries: &VecDeque<Entry>) -> HashMap<u64, u8> {
+    let mut map = HashMap::new();
+    for e in entries.iter() {
+        if matches!(e.tag, Tag::Request) {
+            if let Some(slave) = e.slave() {
+                map.insert(e.counter, slave);
+            }
+        }
+    }
+    map
+}
+
+/// Whether `entry` should be hidden given the user's hidden-slave set.
+///
+/// An entry whose slave cannot be determined (e.g. a parse failure with empty
+/// raw, or a timeout whose request was already pruned) is never hidden —
+/// hiding only happens for a known slave that the user asked to filter out.
+pub fn is_hidden(entry: &Entry, map: &HashMap<u64, u8>, hidden: &HashSet<u8>) -> bool {
+    let slave = entry.slave().or_else(|| map.get(&entry.counter).copied());
+    match slave {
+        Some(s) => hidden.contains(&s),
+        None => false,
+    }
 }
 
 // --- builders ----------------------------------------------------------------
@@ -549,5 +587,59 @@ mod tests {
         assert_eq!(lines[1], "  Error: Bad CRC (expected 0x1234, computed 0x5678)");
         // smoke-check the helper used by the test itself
         let _ = hex_line_of(&Entry::timeout(ts(), 1));
+    }
+
+    fn req_pdu() -> ParsedPdu {
+        parse_pdu(Role::Unknown, 0x03, &[0x00, 0x00, 0x00, 0x0A])
+    }
+
+    /// The filter must hide a whole session: a request, its response, and the
+    /// synthetic Timeout/NoResponse that reuse the request's counter. The
+    /// slave for Timeout/NoResponse is recovered via the counter→slave map.
+    #[test]
+    fn filter_hides_session_including_timeout() {
+        let p = req_pdu();
+        let mut entries: VecDeque<Entry> = VecDeque::new();
+        // counter 1 → slave 2 (will be hidden)
+        entries.push_back(Entry::request(ts(), 1, vec![2, 3], 2, p.clone()));
+        entries.push_back(Entry::response(ts(), 1, vec![2, 3], 2, p.clone()));
+        entries.push_back(Entry::timeout(ts(), 1)); // no slave field
+        entries.push_back(Entry::no_response(ts(), 1)); // no slave field
+        // counter 2 → slave 3 (visible)
+        entries.push_back(Entry::request(ts(), 2, vec![3, 3], 3, p.clone()));
+        entries.push_back(Entry::response(ts(), 2, vec![3, 3], 3, p.clone()));
+
+        let map = counter_slave_map(&entries);
+        assert_eq!(map.get(&1), Some(&2));
+        assert_eq!(map.get(&2), Some(&3));
+
+        let mut hidden = HashSet::new();
+        hidden.insert(2);
+
+        // Slave-2 session fully hidden, including Timeout/NoResponse via map.
+        assert!(is_hidden(&entries[0], &map, &hidden)); // request slave 2
+        assert!(is_hidden(&entries[1], &map, &hidden)); // response slave 2
+        assert!(is_hidden(&entries[2], &map, &hidden)); // timeout counter 1 → slave 2
+        assert!(is_hidden(&entries[3], &map, &hidden)); // no_response counter 1 → slave 2
+        // Slave-3 session visible.
+        assert!(!is_hidden(&entries[4], &map, &hidden));
+        assert!(!is_hidden(&entries[5], &map, &hidden));
+
+        // Empty hidden set hides nothing.
+        let empty = HashSet::new();
+        assert!(!is_hidden(&entries[0], &map, &empty));
+    }
+
+    /// A timeout whose request is absent from the map (e.g. pruned) is never
+    /// hidden — the hard constraint is that nothing is silently dropped.
+    #[test]
+    fn orphaned_timeout_without_request_is_shown() {
+        let mut entries: VecDeque<Entry> = VecDeque::new();
+        entries.push_back(Entry::timeout(ts(), 99)); // no matching request
+        let map = counter_slave_map(&entries);
+        assert!(map.is_empty());
+        let mut hidden = HashSet::new();
+        hidden.insert(2);
+        assert!(!is_hidden(&entries[0], &map, &hidden));
     }
 }

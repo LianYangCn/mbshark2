@@ -4,23 +4,25 @@
 //! rendered as colored monospace spans. A per-entry lines cache is kept by the
 //! app so `format_entry` isn't re-run every frame.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use egui::{Color32, RichText};
 
-use crate::render::format::{should_separate, Line, SpanRole};
+use crate::render::format::{counter_slave_map, is_hidden, should_separate, Line, SpanRole};
 use crate::session::model::Tag;
 
 /// Error / parse-failure color shared between the capture view and header banner.
 pub const ERROR_RED: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49);
 
 /// Render the capture view inside a vertical `ScrollArea`. Pinned to the
-/// bottom while `auto_scroll` is on.
+/// bottom while `auto_scroll` is on. Entries whose slave is in `hidden` are
+/// skipped (never removed from the underlying list).
 pub fn show(
     ui: &mut egui::Ui,
     entries: &VecDeque<crate::session::model::Entry>,
     lines_cache: &VecDeque<Vec<Line>>,
     auto_scroll: bool,
+    hidden: &HashSet<u8>,
 ) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -35,8 +37,12 @@ pub fn show(
                 .size = 13.0;
             ui.set_style(layout);
 
+            let map = counter_slave_map(entries);
             let mut prev_counter: Option<u64> = None;
             for (entry, lines) in entries.iter().zip(lines_cache.iter()) {
+                if is_hidden(entry, &map, hidden) {
+                    continue; // skipped entries don't update prev_counter
+                }
                 if should_separate(prev_counter, entry.counter, entry.tag) {
                     ui.separator();
                 }

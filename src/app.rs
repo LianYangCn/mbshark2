@@ -88,6 +88,12 @@ impl App {
         let mut settings = SettingsState::default();
         settings.refresh_ports();
 
+        // Load persisted config first; the autostart env var below still wins
+        // for the port (env > config > defaults).
+        if let Some(cfg) = crate::config::load() {
+            settings.apply_persisted(&cfg);
+        }
+
         // Scriptability hook: `MBSHARK_AUTOSTART_PORT=/path` pre-fills the port
         // and starts capture on the first frame, so automated tests don't need
         // to drive the GUI with xdotool just to begin capturing.
@@ -166,10 +172,11 @@ impl eframe::App for App {
         }
 
         // Auto-export hook: dump current entries to a file every ~1 s.
+        // Unfiltered (empty hidden set) so scripted output stays complete.
         if let Some(path) = self.autoexport_path.clone() {
             self.autoexport_tick = self.autoexport_tick.wrapping_add(1);
             if self.autoexport_tick.is_multiple_of(20) {
-                export::write_entries(&self.entries, &path);
+                export::write_entries(&self.entries, &path, &std::collections::HashSet::new());
             }
         }
 
@@ -185,9 +192,15 @@ impl eframe::App for App {
                 action = self.settings.render(ui, capturing, &cmd_tx, &self.entries);
             });
 
-        if matches!(action, SettingsAction::Clear) {
-            self.entries.clear();
-            self.lines_cache.clear();
+        match action {
+            SettingsAction::Clear => {
+                self.entries.clear();
+                self.lines_cache.clear();
+            }
+            SettingsAction::SaveConfig => {
+                crate::config::save(&self.settings.to_persisted());
+            }
+            SettingsAction::None => {}
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -195,11 +208,13 @@ impl eframe::App for App {
                 ui.colored_label(ERROR_RED, format!("⚠ {err}"));
                 ui.separator();
             }
+            let hidden = self.settings.hidden_set();
             ui_view::show(
                 ui,
                 &self.entries,
                 &self.lines_cache,
                 self.settings.auto_scroll && self.capturing,
+                &hidden,
             );
         });
     }
@@ -208,5 +223,7 @@ impl eframe::App for App {
 impl Drop for App {
     fn drop(&mut self) {
         let _ = self.cmd_tx.try_send(Command::Shutdown);
+        // Auto-save on exit so the user's last settings persist.
+        crate::config::save(&self.settings.to_persisted());
     }
 }

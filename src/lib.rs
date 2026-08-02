@@ -4,7 +4,7 @@
 //! layer (behind the `gui` feature, default on).
 //!
 //! - [`protocol`] — Modbus RTU framing, CRC, and PDU decoding for all FCs.
-//! - [`capture::framer`] — timing-driven RTU frame assembly.
+//! - [`capture::framer`] — RTU frame assembly (length+CRC split primary, 3.5-char gap fallback).
 //! - [`session`] — request/response pairing + timeout/orphan state machine.
 //! - [`render::format`] — shared text formatting (UI + export).
 //!
@@ -19,5 +19,7 @@ pub mod capture;
 
 #[cfg(feature = "gui")]
 pub mod app;
+#[cfg(feature = "gui")]
+pub mod config;
 #[cfg(feature = "gui")]
 pub mod export;

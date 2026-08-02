@@ -159,6 +159,7 @@ impl CaptureEngine {
                         }
                         Ok(n) => {
                             framer.push(&buf[..n], Instant::now());
+                            self.drain_and_process(&mut framer);
                             if framer.overflowed() {
                                 let raw = framer.flush_due();
                                 self.process_frame_raw(raw);
@@ -212,6 +213,18 @@ impl CaptureEngine {
                 let entry = Entry::parse_failure(now, counter, err.raw().to_vec(), err.reason());
                 self.event_tx.send(Event::Entry(entry)).ok();
             }
+        }
+    }
+
+    /// Peel all complete, CRC-valid frames from the framer and feed each
+    /// through `process_frame_raw`. This runs after every `read()` so that
+    /// coalesced frames (multiple RTU frames delivered in one read, common on
+    /// real hardware) are split immediately rather than waiting for the gap
+    /// timer — which cannot see the inter-frame gap because the OS stamps the
+    /// whole read with a single time.
+    fn drain_and_process(&mut self, framer: &mut Framer) {
+        for raw in framer.drain_complete() {
+            self.process_frame_raw(raw);
         }
     }
 

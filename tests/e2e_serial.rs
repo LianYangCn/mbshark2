@@ -231,3 +231,69 @@ fn e2e_timeout_then_orphan() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     });
 }
+
+/// Regression test for real-hardware "sticky packet" behaviour: when two RTU
+/// frames are delivered in a single `read()` (the OS coalesces them, so the
+/// inter-frame time gap is invisible to the framer), they must still be parsed
+/// as two separate entries. We force coalescing deterministically by
+/// concatenating request + response and writing them with one `write_all`.
+#[test]
+fn e2e_coalesced_frames_split() {
+    if !socat_available() {
+        eprintln!("skip: socat not installed");
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = LocalSet::new();
+    local.block_on(&rt, async move {
+        let (_socat, pty_a, pty_b) = spawn_socat("coalesced");
+        for _ in 0..100 {
+            if std::path::Path::new(&pty_a).exists() && std::path::Path::new(&pty_b).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(8);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
+        let engine = CaptureEngine::new(cmd_rx, event_tx, Duration::from_millis(300));
+        let _engine = tokio::task::spawn_local(engine.run());
+
+        cmd_tx
+            .send(EngineCommand::Start(build_cfg(&pty_a, 300)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pty_b)
+            .expect("open pty_b");
+
+        // FC 0x10 request (13 bytes) + response (8 bytes), concatenated and
+        // written in a single call so the engine receives them in one read().
+        let req = frame(2, 0x10, &[0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x01]);
+        let resp = frame(2, 0x10, &[0x00, 0x00, 0x00, 0x02]);
+        let mut both = Vec::with_capacity(req.len() + resp.len());
+        both.extend_from_slice(&req);
+        both.extend_from_slice(&resp);
+        writer.write_all(&both).unwrap();
+
+        let req_entry = next_entry(&mut event_rx, 1000).await;
+        assert_eq!(req_entry.tag, Tag::Request);
+        assert_eq!(req_entry.counter, 1);
+        assert_eq!(req_entry.raw, req);
+
+        let resp_entry = next_entry(&mut event_rx, 1000).await;
+        assert_eq!(resp_entry.tag, Tag::Response);
+        assert_eq!(resp_entry.counter, 1, "response reuses the request counter");
+        assert_eq!(resp_entry.raw, resp);
+
+        assert_no_error(&mut event_rx, 200).await;
+        let _ = cmd_tx.send(EngineCommand::Shutdown).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+}
