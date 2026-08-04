@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="512"
+     height="512"
+     viewBox="0 0 512 512">
+  <defs>
+    <!-- 背景渐变 -->
+    <radialGradient id="bg" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#24292E" />
+      <stop offset="100%" stop-color="#121417" />
+    </radialGradient>
+
+    <!-- RS485 A 信号（正相）：明亮工业橙 -->
+    <linearGradient id="sigA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFAD1F" />
+      <stop offset="100%" stop-color="#FF5D00" />
+    </linearGradient>
+
+    <!-- RS485 B 信号（反相）：深沉工业橙 -->
+    <linearGradient id="sigB" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF5D00" />
+      <stop offset="100%" stop-color="#B32400" />
+    </linearGradient>
+  </defs>
+
+  <!--圆角应用底板 -->
+  <rect width="512" height="512" rx="128" fill="url(#bg)" />
+
+  <!-- RS-485 镜像差分信号（无滤镜纯矢量兼容版） -->
+  <g>
+    <!-- A 信号 (正相) - 低-高-低 -->
+    <path d="M 70,220 L 190,220 L 190,120 L 322,120 L 322,220 L 442,220" 
+          fill="none" 
+          stroke="url(#sigA)" 
+          stroke-width="20" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+
+    <!-- B 信号 (反相) - 高-低-高 -->
+    <path d="M 70,292 L 190,292 L 190,392 L 322,392 L 322,292 L 442,292" 
+          fill="none" 
+          stroke="url(#sigB)" 
+          stroke-width="20" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+  </g>
+</svg>

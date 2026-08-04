@@ -38,8 +38,13 @@ pub fn run() {
         })
         .expect("spawn tokio thread");
 
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../mbshark2.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]),
+        viewport,
         ..Default::default()
     };
 
