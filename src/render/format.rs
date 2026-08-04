@@ -5,7 +5,7 @@
 //! This is the single source of truth for the on-screen / on-disk layout,
 //! matching the three scenarios in the README (normal pair, timeout, orphan).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Local};
 
@@ -135,16 +135,18 @@ pub fn counter_slave_map(entries: &VecDeque<Entry>) -> HashMap<u64, u8> {
     map
 }
 
-/// Whether `entry` should be hidden given the user's hidden-slave set.
+/// Whether `entry` should be shown given the user's show-slave set.
 ///
-/// An entry whose slave cannot be determined (e.g. a parse failure with empty
-/// raw, or a timeout whose request was already pruned) is never hidden —
-/// hiding only happens for a known slave that the user asked to filter out.
-pub fn is_hidden(entry: &Entry, map: &HashMap<u64, u8>, hidden: &HashSet<u8>) -> bool {
+/// - `show_set` is `None` → show everything.
+/// - An entry whose slave cannot be determined (e.g. parse failure / timeout
+///   whose request was already pruned) is always shown — the hard constraint
+///   prevents silently dropping entries.
+pub fn should_show(entry: &Entry, map: &HashMap<u64, u8>, show_set: Option<&std::collections::HashSet<u8>>) -> bool {
     let slave = entry.slave().or_else(|| map.get(&entry.counter).copied());
-    match slave {
-        Some(s) => hidden.contains(&s),
-        None => false,
+    match (slave, show_set) {
+        (None, _) => true,          // unknown slave → always show
+        (Some(_), None) => true,    // no filter → show all
+        (Some(s), Some(set)) => set.contains(&s),
     }
 }
 
@@ -593,19 +595,20 @@ mod tests {
         parse_pdu(Role::Unknown, 0x03, &[0x00, 0x00, 0x00, 0x0A])
     }
 
-    /// The filter must hide a whole session: a request, its response, and the
-    /// synthetic Timeout/NoResponse that reuse the request's counter. The
-    /// slave for Timeout/NoResponse is recovered via the counter→slave map.
+    /// The filter must show an entire session or none of it: a request, its
+    /// response, and the synthetic Timeout/NoResponse that reuse the request's
+    /// counter. The slave for Timeout/NoResponse is recovered via the
+    /// counter→slave map.
     #[test]
-    fn filter_hides_session_including_timeout() {
+    fn filter_shows_only_listed_slaves() {
         let p = req_pdu();
         let mut entries: VecDeque<Entry> = VecDeque::new();
-        // counter 1 → slave 2 (will be hidden)
+        // counter 1 → slave 2 (not in show set)
         entries.push_back(Entry::request(ts(), 1, vec![2, 3], 2, p.clone()));
         entries.push_back(Entry::response(ts(), 1, vec![2, 3], 2, p.clone()));
         entries.push_back(Entry::timeout(ts(), 1)); // no slave field
         entries.push_back(Entry::no_response(ts(), 1)); // no slave field
-        // counter 2 → slave 3 (visible)
+        // counter 2 → slave 3 (in show set)
         entries.push_back(Entry::request(ts(), 2, vec![3, 3], 3, p.clone()));
         entries.push_back(Entry::response(ts(), 2, vec![3, 3], 3, p.clone()));
 
@@ -613,33 +616,35 @@ mod tests {
         assert_eq!(map.get(&1), Some(&2));
         assert_eq!(map.get(&2), Some(&3));
 
-        let mut hidden = HashSet::new();
-        hidden.insert(2);
+        let show: std::collections::HashSet<u8> = [3u8].into_iter().collect();
+        let show_set = Some(&show);
 
-        // Slave-2 session fully hidden, including Timeout/NoResponse via map.
-        assert!(is_hidden(&entries[0], &map, &hidden)); // request slave 2
-        assert!(is_hidden(&entries[1], &map, &hidden)); // response slave 2
-        assert!(is_hidden(&entries[2], &map, &hidden)); // timeout counter 1 → slave 2
-        assert!(is_hidden(&entries[3], &map, &hidden)); // no_response counter 1 → slave 2
+        // Slave-2 session fully hidden (not in show set).
+        assert!(!should_show(&entries[0], &map, show_set)); // request slave 2
+        assert!(!should_show(&entries[1], &map, show_set)); // response slave 2
+        assert!(!should_show(&entries[2], &map, show_set)); // timeout counter 1 → slave 2
+        assert!(!should_show(&entries[3], &map, show_set)); // no_response counter 1 → slave 2
         // Slave-3 session visible.
-        assert!(!is_hidden(&entries[4], &map, &hidden));
-        assert!(!is_hidden(&entries[5], &map, &hidden));
+        assert!(should_show(&entries[4], &map, show_set));
+        assert!(should_show(&entries[5], &map, show_set));
 
-        // Empty hidden set hides nothing.
-        let empty = HashSet::new();
-        assert!(!is_hidden(&entries[0], &map, &empty));
+        // None means show all.
+        assert!(should_show(&entries[0], &map, None));
+        assert!(should_show(&entries[1], &map, None));
     }
 
-    /// A timeout whose request is absent from the map (e.g. pruned) is never
-    /// hidden — the hard constraint is that nothing is silently dropped.
+    /// A timeout whose request is absent from the map (e.g. pruned) is always
+    /// shown — the hard constraint is that nothing is silently dropped.
     #[test]
     fn orphaned_timeout_without_request_is_shown() {
         let mut entries: VecDeque<Entry> = VecDeque::new();
         entries.push_back(Entry::timeout(ts(), 99)); // no matching request
         let map = counter_slave_map(&entries);
         assert!(map.is_empty());
-        let mut hidden = HashSet::new();
-        hidden.insert(2);
-        assert!(!is_hidden(&entries[0], &map, &hidden));
+        let show: std::collections::HashSet<u8> = [2u8].into_iter().collect();
+        // Unknown slave → always shown even if the set only contains other ids.
+        assert!(should_show(&entries[0], &map, Some(&show)));
+        // And of course shown when unbounded.
+        assert!(should_show(&entries[0], &map, None));
     }
 }

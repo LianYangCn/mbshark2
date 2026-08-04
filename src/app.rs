@@ -73,6 +73,8 @@ struct App {
     autoexport_path: Option<std::path::PathBuf>,
     /// Frame counter to throttle auto-export (every ~1 s at 50 ms repaint).
     autoexport_tick: u32,
+    /// Background port discovery so the window opens instantly.
+    port_discovery: Option<std::thread::JoinHandle<Vec<String>>>,
 }
 
 impl App {
@@ -86,7 +88,13 @@ impl App {
         cc.egui_ctx.set_visuals(visuals);
 
         let mut settings = SettingsState::default();
-        settings.refresh_ports();
+
+        // Enumerate serial ports on a background thread so the window
+        // opens instantly. Ports will show up in the dropdown once the
+        // thread completes (typically within one repaint cycle).
+        let port_discovery = Some(std::thread::spawn(|| {
+            crate::capture::serial::available_port_names()
+        }));
 
         // Load persisted config first; the autostart env var below still wins
         // for the port (env > config > defaults).
@@ -127,6 +135,7 @@ impl App {
             autostart_pending,
             autoexport_path,
             autoexport_tick: 0,
+            port_discovery,
         }
     }
 
@@ -161,6 +170,17 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+
+        // Finalize background port discovery (first frame only).
+        if let Some(handle) = &self.port_discovery {
+            if handle.is_finished() {
+                if let Ok(ports) = self.port_discovery.take().unwrap().join() {
+                    self.settings.ports_cache = ports;
+                }
+                // Port discovery is done — Refresh button will re-run
+                // synchronously on user request (slow, but explicit).
+            }
+        }
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
 
         // Fire the autostart once the engine is ready (first frame).
@@ -172,11 +192,11 @@ impl eframe::App for App {
         }
 
         // Auto-export hook: dump current entries to a file every ~1 s.
-        // Unfiltered (empty hidden set) so scripted output stays complete.
+        // Unfiltered (None = show all) so scripted output stays complete.
         if let Some(path) = self.autoexport_path.clone() {
             self.autoexport_tick = self.autoexport_tick.wrapping_add(1);
             if self.autoexport_tick.is_multiple_of(20) {
-                export::write_entries(&self.entries, &path, &std::collections::HashSet::new());
+                export::write_entries(&self.entries, &path, None);
             }
         }
 
@@ -208,13 +228,13 @@ impl eframe::App for App {
                 ui.colored_label(ERROR_RED, format!("⚠ {err}"));
                 ui.separator();
             }
-            let hidden = self.settings.hidden_set();
+            let show_set = self.settings.show_set();
             ui_view::show(
                 ui,
                 &self.entries,
                 &self.lines_cache,
                 self.settings.auto_scroll && self.capturing,
-                &hidden,
+                show_set.as_ref(),
             );
         });
     }

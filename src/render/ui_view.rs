@@ -8,21 +8,21 @@ use std::collections::{HashSet, VecDeque};
 
 use egui::{Color32, RichText};
 
-use crate::render::format::{counter_slave_map, is_hidden, should_separate, Line, SpanRole};
+use crate::render::format::{counter_slave_map, should_separate, should_show, Line, SpanRole};
 use crate::session::model::Tag;
 
 /// Error / parse-failure color shared between the capture view and header banner.
 pub const ERROR_RED: Color32 = Color32::from_rgb(0xf8, 0x51, 0x49);
 
 /// Render the capture view inside a vertical `ScrollArea`. Pinned to the
-/// bottom while `auto_scroll` is on. Entries whose slave is in `hidden` are
-/// skipped (never removed from the underlying list).
+/// bottom while `auto_scroll` is on. Only entries matching the `show_set`
+/// filter are rendered (`None` = show all).
 pub fn show(
     ui: &mut egui::Ui,
     entries: &VecDeque<crate::session::model::Entry>,
     lines_cache: &VecDeque<Vec<Line>>,
     auto_scroll: bool,
-    hidden: &HashSet<u8>,
+    show_set: Option<&HashSet<u8>>,
 ) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -40,8 +40,8 @@ pub fn show(
             let map = counter_slave_map(entries);
             let mut prev_counter: Option<u64> = None;
             for (entry, lines) in entries.iter().zip(lines_cache.iter()) {
-                if is_hidden(entry, &map, hidden) {
-                    continue; // skipped entries don't update prev_counter
+                if !should_show(entry, &map, show_set) {
+                    continue; // filtered entries don't update prev_counter
                 }
                 if should_separate(prev_counter, entry.counter, entry.tag) {
                     ui.separator();
@@ -53,7 +53,8 @@ pub fn show(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         for span in &line.0 {
-                            ui.label(
+                            ui.selectable_label(
+                                false,
                                 RichText::new(&span.text)
                                     .monospace()
                                     .color(role_color(span.role, tag)),

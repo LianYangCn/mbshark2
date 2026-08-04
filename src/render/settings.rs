@@ -35,9 +35,10 @@ pub struct SettingsState {
     pub timeout_ms: u64,
     pub ports_cache: Vec<String>,
     pub auto_scroll: bool,
-    /// Comma-separated slave ids to hide from the view (e.g. `"2,3,5"`).
-    /// Parsed into a set on demand by [`SettingsState::hidden_set`].
-    pub hidden_slaves_str: String,
+    /// Slave-address filter: empty or `"*"` = show all; otherwise only
+    /// matching slaves listed (supports `1,2,3` and `1-3` range syntax).
+    /// Parsed on demand by [`SettingsState::show_set`].
+    pub show_slaves_str: String,
 }
 
 impl Default for SettingsState {
@@ -52,7 +53,7 @@ impl Default for SettingsState {
             timeout_ms: 500,
             ports_cache: Vec::new(),
             auto_scroll: true,
-            hidden_slaves_str: String::new(),
+            show_slaves_str: String::new(),
         }
     }
 }
@@ -95,8 +96,8 @@ impl SettingsState {
 
     /// Snapshot the persistable fields into a TOML-serializable config.
     pub fn to_persisted(&self) -> PersistedConfig {
-        let mut hidden: Vec<u8> = self.hidden_set().into_iter().collect();
-        hidden.sort_unstable();
+        let mut show: Vec<u8> = self.show_set().into_iter().flatten().collect();
+        show.sort_unstable();
         PersistedConfig {
             port: self.port.clone(),
             baud: self.baud.clone(),
@@ -106,7 +107,7 @@ impl SettingsState {
             flow_control: self.flow_control.clone(),
             timeout_ms: self.timeout_ms,
             auto_scroll: self.auto_scroll,
-            hidden_slaves: hidden,
+            show_slaves: show,
         }
     }
 
@@ -120,22 +121,81 @@ impl SettingsState {
         self.flow_control = cfg.flow_control.clone();
         self.timeout_ms = cfg.timeout_ms;
         self.auto_scroll = cfg.auto_scroll;
-        // Re-render the hidden set as a canonical comma-separated string.
-        self.hidden_slaves_str = cfg
-            .hidden_slaves
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        // Canonical form: compact ranges when possible.
+        self.show_slaves_str = Self::canonicalize_slaves(&cfg.show_slaves);
     }
 
-    /// Parse `hidden_slaves_str` into a set of slave ids. Invalid tokens
-    /// (non-numeric, out of u8 range) are silently skipped; duplicates collapse.
-    pub fn hidden_set(&self) -> HashSet<u8> {
-        self.hidden_slaves_str
-            .split(',')
-            .filter_map(|t| t.trim().parse::<u8>().ok())
-            .collect()
+    /// Parse `show_slaves_str` into an optional slave-address filter.
+    ///
+    /// - `""` or `"*"` → `None` (show everything).
+    /// - Otherwise returns `Some(set)` containing only the listed addresses.
+    ///
+    /// Supported syntax:
+    /// - single: `"1,2,3"`
+    /// - range: `"1-3"` (inclusive, order-agnostic)
+    /// - combined: `"1-3,5,7-9"`
+    ///
+    /// Invalid tokens (non-numeric, out of u8 range) are silently skipped;
+    /// duplicates automatically collapse into the set.
+    /// An empty set after parsing (all garbage tokens) also returns `None`.
+    pub fn show_set(&self) -> Option<HashSet<u8>> {
+        let trimmed = self.show_slaves_str.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            return None;
+        }
+        let mut set = HashSet::new();
+        for token in trimmed.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Some((start_str, end_str)) = token.split_once('-') {
+                let start: u8 = match start_str.trim().parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let end: u8 = match end_str.trim().parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                for id in start.min(end)..=start.max(end) {
+                    set.insert(id);
+                }
+            } else if let Ok(id) = token.parse::<u8>() {
+                set.insert(id);
+            }
+        }
+        if set.is_empty() { None } else { Some(set) }
+    }
+
+    /// Convert a sorted list of u8 ids into a compact wire-friendly string
+    /// e.g. `[1,2,3,5,7,8,9]` → `"1-3,5,7-9"`.
+    pub fn canonicalize_slaves(ids: &[u8]) -> String {
+        if ids.is_empty() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        let mut start = ids[0];
+        let mut end = ids[0];
+        for &id in ids.iter().skip(1) {
+            if id == end.wrapping_add(1) {
+                end = id;
+            } else {
+                if start == end {
+                    parts.push(format!("{start}"));
+                } else {
+                    parts.push(format!("{start}-{end}"));
+                }
+                start = id;
+                end = id;
+            }
+        }
+        if start == end {
+            parts.push(format!("{start}"));
+        } else {
+            parts.push(format!("{start}-{end}"));
+        }
+        parts.join(",")
     }
 
     /// Render the panel. Returns a [`SettingsAction`] for the app to apply.
@@ -239,15 +299,15 @@ impl SettingsState {
             );
         });
 
-        // Hidden slaves: comma-separated ids filtered from the view + export.
-        // Captured entries are never discarded (hard constraint); they are
-        // only skipped at render/export time. autoexport stays unfiltered.
+        // Show slaves: comma-separated ids or ranges (1-3); empty or * = show all.
+        // Entries are never discarded at capture time; filtering only affects
+        // the view and manual export. Auto-export stays unfiltered.
         ui.horizontal(|ui| {
-            ui.label("Hide slaves:");
+            ui.label("Show slaves:");
             ui.add(
-                egui::TextEdit::singleline(&mut self.hidden_slaves_str)
-                    .desired_width(120.0)
-                    .hint_text("2,3,5"),
+                egui::TextEdit::singleline(&mut self.show_slaves_str)
+                    .desired_width(140.0)
+                    .hint_text("* or 1-3,5,7-9"),
             );
         });
 
@@ -276,7 +336,7 @@ impl SettingsState {
                 action = SettingsAction::Clear;
             }
             if ui.button("💾 Export…").clicked() {
-                export::export_entries(entries, &self.hidden_set());
+                export::export_entries(entries, self.show_set().as_ref());
             }
             if ui.button("💾 Save Config").clicked() {
                 action = SettingsAction::SaveConfig;
@@ -298,42 +358,158 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_set_parses_loose_input() {
+    fn show_set_none_when_blank() {
         let s = SettingsState {
-            hidden_slaves_str: "2, 3 ,abc,3,300,".into(),
+            show_slaves_str: "".into(),
             ..Default::default()
         };
-        let set = s.hidden_set();
+        assert!(s.show_set().is_none());
+    }
+
+    #[test]
+    fn show_set_none_when_star() {
+        let s = SettingsState {
+            show_slaves_str: "*".into(),
+            ..Default::default()
+        };
+        assert!(s.show_set().is_none());
+    }
+
+    #[test]
+    fn show_set_parses_loose_input() {
+        let s = SettingsState {
+            show_slaves_str: "2, 3 ,abc,3,300,".into(),
+            ..Default::default()
+        };
+        let set = s.show_set().unwrap();
         assert_eq!(set, [2, 3].into_iter().collect::<HashSet<_>>());
     }
 
     #[test]
-    fn hidden_set_empty_when_blank() {
+    fn show_set_none_when_all_garbage() {
         let s = SettingsState {
-            hidden_slaves_str: "".into(),
+            show_slaves_str: "abc,xyz,,".into(),
             ..Default::default()
         };
-        assert!(s.hidden_set().is_empty());
+        // All tokens invalid → returns None (show all) as fallback.
+        assert!(s.show_set().is_none());
     }
 
     #[test]
-    fn persisted_roundtrip_preserves_hidden_slaves() {
+    fn show_set_parses_range() {
         let s = SettingsState {
-            hidden_slaves_str: "3,2".into(),
+            show_slaves_str: "1-3".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.show_set().unwrap(),
+            [1, 2, 3].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn show_set_parses_inverted_range() {
+        let s = SettingsState {
+            show_slaves_str: "5-2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.show_set().unwrap(),
+            [2, 3, 4, 5].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn show_set_parses_combined() {
+        let s = SettingsState {
+            show_slaves_str: "1-3,5,7-9".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.show_set().unwrap(),
+            [1, 2, 3, 5, 7, 8, 9].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn show_set_parses_overlapping_ranges() {
+        let s = SettingsState {
+            show_slaves_str: "1-5,3-7".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.show_set().unwrap(),
+            [1, 2, 3, 4, 5, 6, 7].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn canonicalize_slaves_compact_ranges() {
+        assert_eq!(
+            SettingsState::canonicalize_slaves(&[1, 2, 3, 5, 7, 8, 9]),
+            "1-3,5,7-9"
+        );
+    }
+
+    #[test]
+    fn canonicalize_slaves_single_values() {
+        assert_eq!(
+            SettingsState::canonicalize_slaves(&[2, 5, 9]),
+            "2,5,9"
+        );
+    }
+
+    #[test]
+    fn canonicalize_slaves_empty() {
+        assert_eq!(SettingsState::canonicalize_slaves(&[]), "");
+    }
+
+    #[test]
+    fn canonicalize_slaves_single() {
+        assert_eq!(SettingsState::canonicalize_slaves(&[42]), "42");
+    }
+
+    #[test]
+    fn canonicalize_slaves_edge_overflow_safe() {
+        assert_eq!(
+            SettingsState::canonicalize_slaves(&[253, 254, 255]),
+            "253-255"
+        );
+    }
+
+    #[test]
+    fn persisted_roundtrip_preserves_show_slaves() {
+        let s = SettingsState {
+            show_slaves_str: "3,2".into(),
             baud: "115200".into(),
             timeout_ms: 400,
             ..Default::default()
         };
         let cfg = s.to_persisted();
-        // Sorted + deduped on the way out.
-        assert_eq!(cfg.hidden_slaves, vec![2, 3]);
+        assert_eq!(cfg.show_slaves, vec![2, 3]);
         assert_eq!(cfg.baud, "115200");
 
-        // apply_persisted re-canonicalizes the string.
         let mut s2 = SettingsState::default();
         s2.apply_persisted(&cfg);
-        assert_eq!(s2.hidden_set(), [2, 3].into_iter().collect::<HashSet<_>>());
+        assert_eq!(
+            s2.show_set().unwrap(),
+            [2, 3].into_iter().collect::<HashSet<_>>()
+        );
         assert_eq!(s2.baud, "115200");
         assert_eq!(s2.timeout_ms, 400);
+    }
+
+    #[test]
+    fn persisted_roundtrip_preserves_range_compact() {
+        let s = SettingsState {
+            show_slaves_str: "1-5".into(),
+            ..Default::default()
+        };
+        let cfg = s.to_persisted();
+        assert_eq!(cfg.show_slaves, vec![1, 2, 3, 4, 5]);
+
+        let mut s2 = SettingsState::default();
+        s2.apply_persisted(&cfg);
+        assert_eq!(s2.show_slaves_str, "1-5");
     }
 }

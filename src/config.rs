@@ -1,10 +1,10 @@
 //! Persistent user configuration (TOML).
 //!
 //! The settings panel state that a user would reasonably want across restarts
-//! (port / baud / framing / timeout / auto-scroll / hidden slaves) is stored
-//! at a platform-appropriate config path and reloaded on launch. `load()`
-//! always falls back to defaults on any error, so a corrupt file never blocks
-//! startup.
+//! (port / baud / framing / timeout / auto-scroll / show-slaves filter) is
+//! stored at a platform-appropriate config path and reloaded on launch.
+//! `load()` always falls back to defaults on any error, so a corrupt file
+//! never blocks startup.
 
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ pub struct PersistedConfig {
     pub flow_control: String,
     pub timeout_ms: u64,
     pub auto_scroll: bool,
-    pub hidden_slaves: Vec<u8>,
+    pub show_slaves: Vec<u8>,
 }
 
 impl Default for PersistedConfig {
@@ -40,7 +40,7 @@ impl Default for PersistedConfig {
             flow_control: "None".into(),
             timeout_ms: 500,
             auto_scroll: true,
-            hidden_slaves: Vec::new(),
+            show_slaves: Vec::new(),
         }
     }
 }
@@ -156,19 +156,19 @@ mod tests {
             flow_control: "None".into(),
             timeout_ms: 400,
             auto_scroll: false,
-            hidden_slaves: vec![2, 3],
+            show_slaves: vec![2, 3],
         };
         let text = toml::to_string(&cfg).unwrap();
         let back: PersistedConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.port, "/dev/ttyUSB0");
         assert_eq!(back.baud, "115200");
         assert_eq!(back.timeout_ms, 400);
-        assert_eq!(back.hidden_slaves, vec![2, 3]);
+        assert_eq!(back.show_slaves, vec![2, 3]);
     }
 
     #[test]
     fn missing_field_uses_default() {
-        // An older config file lacking `hidden_slaves` and `auto_scroll` must
+        // An older config file lacking `show_slaves` and `auto_scroll` must
         // still load via `#[serde(default)]`.
         let text = r#"
 port = "/dev/ttyS0"
@@ -182,7 +182,7 @@ timeout_ms = 500
         let cfg: PersistedConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.port, "/dev/ttyS0");
         assert!(cfg.auto_scroll, "default auto_scroll is true");
-        assert!(cfg.hidden_slaves.is_empty(), "default hidden_slaves is empty");
+        assert!(cfg.show_slaves.is_empty(), "default show_slaves is empty");
     }
 
     #[test]
@@ -208,14 +208,14 @@ timeout_ms = 500
             flow_control: "None".into(),
             timeout_ms: 400,
             auto_scroll: false,
-            hidden_slaves: vec![2, 3],
+            show_slaves: vec![2, 3],
         };
         save_at(&path, &cfg);
         let back = load_at(&path).expect("saved config loads back");
         assert_eq!(back.port, "/tmp/mb_a");
         assert_eq!(back.baud, "115200");
         assert_eq!(back.timeout_ms, 400);
-        assert_eq!(back.hidden_slaves, vec![2, 3]);
+        assert_eq!(back.show_slaves, vec![2, 3]);
         // The temp file is gone after rename — only config.toml exists.
         assert!(!path.with_extension("toml.tmp").exists());
 
