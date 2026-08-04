@@ -53,7 +53,7 @@ pub fn show(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         for span in &line.0 {
-                            ui.selectable_label(
+                            let _ = ui.selectable_label(
                                 false,
                                 RichText::new(&span.text)
                                     .monospace()
