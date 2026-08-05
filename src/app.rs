@@ -1,9 +1,9 @@
 //! eframe application: spawns the tokio thread, owns the channels, drains
 //! events each frame, and renders the settings panel + capture view.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -17,8 +17,13 @@ use crate::session::model::Entry;
 /// Maximum entries retained in memory (FIFO, drop oldest).
 const MAX_ENTRIES: usize = 10_000;
 
-/// Repaint cadence so the UI keeps draining the event channel while idle.
-const REPAINT_INTERVAL: Duration = Duration::from_millis(50);
+/// Repaint interval while data is flowing (capturing) — fast enough for
+/// real-time feel without burning CPU.
+const ACTIVE_REPAINT: Duration = Duration::from_millis(100);
+
+/// Repaint interval while idle (no capture, no events) — a long poll to
+/// keep CPU near zero.
+const IDLE_REPAINT: Duration = Duration::from_millis(500);
 
 pub fn run() {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(8);
@@ -69,6 +74,8 @@ struct App {
     event_rx: mpsc::UnboundedReceiver<Event>,
     entries: VecDeque<Entry>,
     lines_cache: VecDeque<Vec<Line>>,
+    /// Cached `counter → slave` map rebuilt only when entries change.
+    slave_map_cache: HashMap<u64, u8>,
     settings: SettingsState,
     capturing: bool,
     last_error: Option<String>,
@@ -76,8 +83,8 @@ struct App {
     autostart_pending: bool,
     /// When set, entries are periodically written here as plain text.
     autoexport_path: Option<std::path::PathBuf>,
-    /// Frame counter to throttle auto-export (every ~1 s at 50 ms repaint).
-    autoexport_tick: u32,
+    /// Last time auto-export wrote to disk (throttle to every ~1 s).
+    last_autoexport: Option<Instant>,
     /// Background port discovery so the window opens instantly.
     port_discovery: Option<std::thread::JoinHandle<Vec<String>>>,
 }
@@ -91,6 +98,14 @@ impl App {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(0x0d, 0x11, 0x17);
         cc.egui_ctx.set_visuals(visuals);
+
+        // Set monospace font size once during init so ui_view doesn't
+        // need to clone and apply Style every frame.
+        let mut style = (*cc.egui_ctx.global_style()).clone();
+        style
+            .text_styles
+            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
+        cc.egui_ctx.set_global_style(style);
 
         let mut settings = SettingsState::default();
 
@@ -134,18 +149,24 @@ impl App {
             event_rx,
             entries: VecDeque::new(),
             lines_cache: VecDeque::new(),
+            slave_map_cache: HashMap::new(),
             settings,
             capturing: false,
             last_error: None,
             autostart_pending,
             autoexport_path,
-            autoexport_tick: 0,
+            last_autoexport: None,
             port_discovery,
         }
     }
 
-    fn drain_events(&mut self) {
+    /// Drain pending events from the channel.
+    /// Returns `true` if any entries were added or removed (i.e. the
+    /// display data changed), so the caller can request a repaint.
+    fn drain_events(&mut self) -> bool {
+        let mut entries_changed = false;
         while let Ok(ev) = self.event_rx.try_recv() {
+            entries_changed = true;
             match ev {
                 Event::Entry(entry) => {
                     let lines = format_entry(&entry);
@@ -169,12 +190,16 @@ impl App {
                 }
             }
         }
+        if entries_changed {
+            self.slave_map_cache = crate::render::format::counter_slave_map(&self.entries);
+        }
+        entries_changed
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        let entries_changed = self.drain_events();
 
         // Finalize background port discovery (first frame only).
         if let Some(handle) = &self.port_discovery {
@@ -182,11 +207,18 @@ impl eframe::App for App {
                 if let Ok(ports) = self.port_discovery.take().unwrap().join() {
                     self.settings.ports_cache = ports;
                 }
-                // Port discovery is done — Refresh button will re-run
-                // synchronously on user request (slow, but explicit).
             }
         }
-        ui.ctx().request_repaint_after(REPAINT_INTERVAL);
+
+        // Smart repaint: request immediate redraw when new data arrived;
+        // use an active interval during capture; drop to idle when quiet.
+        if entries_changed {
+            ui.ctx().request_repaint();
+        } else if self.capturing {
+            ui.ctx().request_repaint_after(ACTIVE_REPAINT);
+        } else {
+            ui.ctx().request_repaint_after(IDLE_REPAINT);
+        }
 
         // Fire the autostart once the engine is ready (first frame).
         if self.autostart_pending && !self.capturing && !self.settings.port.is_empty() {
@@ -198,10 +230,15 @@ impl eframe::App for App {
 
         // Auto-export hook: dump current entries to a file every ~1 s.
         // Unfiltered (None = show all) so scripted output stays complete.
+        // Uses real elapsed time so it stays ~1 s regardless of repaint cadence.
         if let Some(path) = self.autoexport_path.clone() {
-            self.autoexport_tick = self.autoexport_tick.wrapping_add(1);
-            if self.autoexport_tick.is_multiple_of(20) {
+            let now = Instant::now();
+            let expired = self
+                .last_autoexport
+                .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1));
+            if expired {
                 export::write_entries(&self.entries, &path, None);
+                self.last_autoexport = Some(now);
             }
         }
 
@@ -221,6 +258,7 @@ impl eframe::App for App {
             SettingsAction::Clear => {
                 self.entries.clear();
                 self.lines_cache.clear();
+                self.slave_map_cache.clear();
             }
             SettingsAction::SaveConfig => {
                 crate::config::save(&self.settings.to_persisted());
@@ -238,6 +276,7 @@ impl eframe::App for App {
                 ui,
                 &self.entries,
                 &self.lines_cache,
+                &self.slave_map_cache,
                 self.settings.auto_scroll && self.capturing,
                 show_set.as_ref(),
             );
